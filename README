@@ -1,0 +1,154 @@
+TCP/UDP server - client - PC - Oprea Theodor-Alin
+time to implement: 20h
+
+For testing:
+sudo python3 test.py
+
+or manually
+./server <PORT>
+./client <ID_client> <IP_server> <PORT_server>
+
+The application is composed of 2 main parts, the server side and the TCP client
+side. For the TCP communication I used 2 types of messages, one for the
+subscribe / unsubscribe commands, and a more general one, which keeps info
+about the metadata of the sender (ip_address:port) and the actual content of
+the message, purposely a bigger statically allocated buffer, so that this kind
+of message can be used for a variety of contexts, such as an exit command from
+the server to the client, or a redirected message, from the udp clients to the
+subscribed clients (which will be later parced and used by the client). This
+generalised method was chosed due to the fact that I wanted to keep a good flow
+inside the server, the less time a UDP message remains inside the server, the
+smoother the server runs. Since we don't parse the actual message in the
+server, but in the client, we greatly reduce the strain on the server side.
+
+Also, to make sure that the number of recieved / sent bytes is the one we
+expect, we make the sending and the recieving in a loop, taking into account
+the number of remaining bytes to send / recieve, and the number of bytes
+already sent / recieved. This way, we make sure that we recieve the whole
+expected message in case the message gets split mid transmission or the number
+of sent / recieved bytes is somehow capped.
+
+---------- The server ----------
+
+The server starts with opening 2 sockets, one for recieving UDP messages and
+another for accepting multiple TCP clients to connect to our server. (We only
+need one UDP socket for multiple clients since the information is transmitted
+ad datagrams, which contains info about the sender, but the TCP communication
+is represented as a flow of bytes, not containing info about the server => we
+will need an individual TCP socket for each TCP client). After requesting the
+TCP and UDP sockets, I add STDIN and these 2 socket file descriptors to a file
+descriptor set through which I iterate endlessly, untill the server recieves
+information through one file descriptor, either STDIN, messages on UDP socket
+or TCP connection requests on the TCP socket. I also keep track of information
+using unordered maps, I store the socket - userid (connected users) corelation
+in one map, the userid - client data structure (all users that have connected
+so far) in another map and the topic_name - topic data structure in another.
+After setting up the sockets, maps and file descriptor set I have the following
+events defined in an event loop:
+
+When reading from STDIN I check the following commands:
+- the exit command, which sends an exit command to each connected client (by
+iterating through the socket to userid map) and closes all sockets
+- the print command (helper), which prints all clients, online or not
+- the topics command (helper), which prints all topics with all clients
+subscribed to each topic, with the subscription type (sf variable)
+
+When recieving a UDP message:
+- initialize the reading buffer and read from the socket
+- extract the topic from the message
+- store the metadata of the sender (ip:port) for later use
+- iterate through all clients subscribed to that topic, online or not, and
+redirect the content of the message (including the metadata) to the online
+users and store the message in the offline users' storage
+
+When recieving a TCP connection request:
+- requesting a new socket for the new client
+- deactivate Neagle's Algorithm
+- check if a user with the same userid exists and is connected
+- if yes => duplicate userid => exit command to the client and removal from
+server data
+- otherwise => reconnection of a previous user => updating the client's status
+to online and sending all it's stored messages
+- if no client with the given userid is found then we have a new client
+connecting => populate a new client => add it to the server's data
+
+When recieving a TCP message on one of the TCP sockets:
+- initialize the reading buffer and read exactly the size of an expected
+message and cast the message to a Message structure to easily access it's
+contents
+- if no bytes are recieved => the client has disconnected => close the socket
+and the connection and print the update
+- if it is a subscribe command => add the client to the topics subscriptions
+with the client's userid as the key and the sf as the value, if the topic
+doesn't already exist, create it and add the client as a subscriber
+- if it is an unsubscribe command => remove the client from the subscribers'
+map or throw an error if the topic doesn't exit
+- print the message if it isn't a subscribe / unsubscribe command
+
+In the client data structure I keep info about the client's user if, it's file
+descriptor (-1 if it isn't online), the online status and a deque that keeps
+all the messages that have been sent while the user was away.
+
+In the Topic data structure I keep the the name of the topic and a map to keep
+track of all the subscribed clients, the userid of the subscribed client as the
+key and the type of subscription as the value (the sf)
+
+---------- The TCP client ----------
+
+Similarly to the server, I start by initialising the socket that will be used
+with the server, add the file descriptors in the file descriptors set (STDIN
+and the tcp socket) and before starting listening for input on either of the
+file descriptors I send a message to the server containing the intended userid.
+After the initialisation, I set an event loop, with the following events:
+
+Input on STDIN:
+- initialise the reading buffer
+- on "exit" command, exit the program
+- on subscribe command, parse the input considering the 3 arguments, the
+"subscribe" command, the topic and the sf variable and send the message and
+print the fact that the client is subscribed
+- on unsubscribe command, parse the input for 2 arguments, the "unsubscribe"
+command and the topic, then send the message and print the fact that the client
+is unsubcribed from the topic
+
+Input on TCP socket:
+- read the size of a Message from the stream, initialize the buffer and cast
+it to a message
+- if the type is 0, read the sign byte and the next 4 "value" bytes => convert
+the value from the network order to host order => apply the sign
+- if the type is 1, read 2 bytes from the mesage => convert from network order
+to host order and divide by 100 ("short real type")
+- if type is 2, read one byte for sign, 4 bytes for actual value and one byte
+for the power of 10 by which to divide the value to => convert the value from
+network to host order, apply the sign, then divide by 10 the number of times
+given by the variable
+- if the type is 3, print the message as it is, since it is a string,
+indicating it's type
+- otherwise (for further development) print the message as it is without
+specifying it's type
+
+---------- Application Level Protocol ----------
+
+For the applciation level protocol, I decided to use 2 types of message
+encoding, one for the commands sent from the TCP client to the server, either
+subscribe (type is 1) or unsubscribe (type is 2) (leaving the door open for
+further development), which contains info about the type of the command sent,
+the topic and the sf variable, which can be easily converted or built upon,
+if the application needs further upgrades.
+
+Also, for a greater generality, I used a minimalist message structure for
+messages from the server to the TCP clients, which contains the metadata of
+the message, ip:port of the sender, the actual contents of the message and the
+type of the message (1 for exit command and 2 for content message). The
+reasoning behind this is that I wanted to free as much strain from the server
+as possible, redirecting the message from the UDP server to the subscribed to
+that topic TCP clients, after completing the info of the message, ip:port of
+the UDP sender, the type of the message (based on which will be interpreted
+accordingly in the client), 1 for exit command and 2 for message with content.
+With this, the application can be easily improved, a new feature can be added
+by simply setting a new variable for the type field inside Message (which can
+designate a completely different command), keeping the generality of the
+message container, since inside the buffer of 1600 length data can be stored
+in various ways, not only topic:type:message format, but any format that can be
+defined by byte counts within this 1600 bytes limit.
+
